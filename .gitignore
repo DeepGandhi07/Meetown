@@ -1,0 +1,15 @@
+# Dependencies and build artifacts
+**/node_modules/
+**/dist/
+**/coverage/
+
+# Local configuration and secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Logs and editor files
+*.log
+.DS_Store
+.vscode/
+.idea/
