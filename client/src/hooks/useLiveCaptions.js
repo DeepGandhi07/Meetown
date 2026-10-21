@@ -4,22 +4,20 @@ const MAX_CAPTIONS = 100;
 
 /**
  * Receives normalized caption events from the Meetown signaling server.
- * The self-hosted speech-recognition/translation worker is a separate next step;
- * this hook deliberately does not call a browser/cloud speech API.
+ * Speech recognition and translation run on the server; this hook only displays results.
  *
- * Expected server event: `caption:result`
+ * Server events: `caption:result` and `caption:status` ({ state: "ready" | "unavailable", message }).
+ * Expected `caption:result` payload:
  * { id?, speakerId?, speakerName?, sourceLanguage?, targetLanguage?,
  *   originalText, translatedText?, isFinal?, timestamp? }
  */
 export function useLiveCaptions({ socket, enabled, targetLanguage, sourceLanguage = "auto" }) {
   const [captions, setCaptions] = useState([]);
   const [connectionState, setConnectionState] = useState("waiting");
+  const [statusMessage, setStatusMessage] = useState("");
 
   useEffect(() => {
-    if (!enabled || !socket) {
-      setConnectionState("waiting");
-      return undefined;
-    }
+    if (!enabled || !socket) return undefined;
 
     const handleCaption = (payload = {}) => {
       if (!payload.originalText && !payload.translatedText) return;
@@ -57,14 +55,26 @@ export function useLiveCaptions({ socket, enabled, targetLanguage, sourceLanguag
         return [...current, caption].slice(-MAX_CAPTIONS);
       });
       setConnectionState("receiving");
+      setStatusMessage("");
     };
 
+    const handleStatus = ({ state, message } = {}) => {
+      if (state === "unavailable") {
+        setConnectionState("unavailable");
+        setStatusMessage(message || "Captions are temporarily unavailable.");
+      } else {
+        setStatusMessage("");
+        setConnectionState((current) => (current === "unavailable" ? "waiting" : current));
+      }
+    };
     const handleConnect = () => setConnectionState("waiting");
+    socket.on("caption:status", handleStatus);
     socket.on("caption:result", handleCaption);
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleConnect);
 
     return () => {
+      socket.off("caption:status", handleStatus);
       socket.off("caption:result", handleCaption);
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleConnect);
@@ -91,5 +101,13 @@ export function useLiveCaptions({ socket, enabled, targetLanguage, sourceLanguag
 
   const clearCaptions = useCallback(() => setCaptions([]), []);
 
-  return { captions, connectionState, addPreviewCaption, clearCaptions };
+  // Outside an active session the badge always reads "waiting".
+  const active = Boolean(enabled && socket);
+  return {
+    captions,
+    connectionState: active ? connectionState : "waiting",
+    statusMessage: active ? statusMessage : "",
+    addPreviewCaption,
+    clearCaptions,
+  };
 }

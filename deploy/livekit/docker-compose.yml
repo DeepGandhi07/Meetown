@@ -1,0 +1,26 @@
+# Self-hosted media server for a single VPS (e.g. Hetzner). Host networking is recommended for WebRTC.
+# 1) Point DNS  livekit.example.com -> VPS IP
+# 2) cp .env.example .env  and fill it in
+# 3) Open firewall: 80/tcp, 443/tcp, 7881/tcp, 50000-60000/udp
+# 4) docker compose up -d
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+  caddy:
+    image: caddy:2
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      LIVEKIT_DOMAIN: "${LIVEKIT_DOMAIN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+volumes:
+  caddy_data:

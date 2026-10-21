@@ -13,6 +13,7 @@ export default function CaptionPanel({
   onTargetLanguageChange,
   captions,
   connectionState,
+  statusMessage,
   onPreviewCaption,
   onClearCaptions,
 }) {
@@ -21,8 +22,14 @@ export default function CaptionPanel({
       <div className="translate-status">
         <div className="translate-status-icon" aria-hidden="true">文<span>↔</span>A</div>
         <div className="translate-status-copy"><b>Meetown Captions</b><small>Multilingual captions workspace</small></div>
-        <span className={`caption-state-badge state-${connectionState}`}>{connectionState === "receiving" ? "RECEIVING" : "NOT CONNECTED"}</span>
+        <span className={`caption-state-badge state-${connectionState}`}>{{ receiving: "RECEIVING", unavailable: "UNAVAILABLE" }[connectionState] || "LISTENING"}</span>
       </div>
+
+      {connectionState === "unavailable" && (
+        <p className="error caption-unavailable" role="status">
+          {statusMessage || "Captions are temporarily unavailable."} The meeting is not affected; captions resume automatically.
+        </p>
+      )}
 
       <div className="toggle-row">
         <div><b>Show captions</b><small>Display the latest caption on the meeting stage</small></div>
@@ -33,7 +40,7 @@ export default function CaptionPanel({
       <select id="source-language" className="dark-select" value={sourceLanguage} onChange={(event) => onSourceLanguageChange(event.target.value)}>
         {SOURCE_LANGUAGE_OPTIONS.map((language) => <option key={language.value} value={language.value}>{language.label}</option>)}
       </select>
-      <p className="caption-field-help">Speech detection runs on your configured self-hosted caption worker. Select a language to improve recognition when known.</p>
+      <p className="caption-field-help">Select the language being spoken to improve recognition, or leave it on auto-detect.</p>
 
       <label className="field-label" htmlFor="target-language">Translate captions into</label>
       <select id="target-language" className="dark-select" value={targetLanguage} onChange={(event) => onTargetLanguageChange(event.target.value)}>
@@ -49,7 +56,7 @@ export default function CaptionPanel({
           <div className="caption-empty-state">
             <span className="caption-empty-icon">⌁</span>
             <b>Waiting for speech</b>
-            <p>Speak for a few seconds with captions enabled. The self-hosted worker will transcribe and translate when the required model and language pair are installed.</p>
+            <p>Speak for a few seconds with captions enabled. Captions appear for everyone who has them switched on, in their own language.</p>
           </div>
         ) : (
           <div className="caption-transcript-list" aria-live="polite">
@@ -65,7 +72,7 @@ export default function CaptionPanel({
       </div>
 
       <button type="button" className="secondary-button caption-preview-button" onClick={onPreviewCaption}>Preview sample caption</button>
-      <div className="caption-privacy-note"><span>◇</span><p><b>Privacy-first by design</b><br />No browser speech-recognition or commercial translation API is called. Microphone audio is sent to your configured self-hosted caption worker for processing. Audio chunks are not intentionally saved by the worker. Verify your server and model configuration before using sensitive conversations.</p></div>
+      <div className="caption-privacy-note"><span>◇</span><p><b>Privacy-first by design</b><br />While captions are on and your microphone is unmuted, short audio chunks are sent through the Meetown server to the speech provider it is configured with (a cloud service or your own caption worker). Audio is not stored by Meetown. Turn captions off for sensitive conversations.</p></div>
     </div>
   );
 }

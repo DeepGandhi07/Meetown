@@ -1,0 +1,4 @@
+# Terminates TLS (automatic Let's Encrypt) and proxies wss:// to LiveKit.
+{$LIVEKIT_DOMAIN} {
+	reverse_proxy 127.0.0.1:7880
+}

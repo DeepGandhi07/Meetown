@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SECONDS = 2;
@@ -37,9 +37,8 @@ export function useCaptionAudio({
   enabled,
   sourceLanguage,
   targetLanguage,
+  epoch = 0, // bumps when the socket re-joins the room, so preferences are re-sent
 }) {
-  const [captureState, setCaptureState] = useState("off");
-
   useEffect(() => {
     const track = stream?.getAudioTracks()?.[0];
     if (
@@ -48,7 +47,6 @@ export function useCaptionAudio({
       !socket?.connected ||
       track.readyState !== "live"
     ) {
-      setCaptureState("off");
       socket?.emit("caption:set-preferences", {
         enabled: false,
         sourceLanguage,
@@ -79,12 +77,14 @@ export function useCaptionAudio({
       }
       sampleCount -= written;
       sending = true;
-      socket.emit(
+      // The timeout guarantees a lost reply can never stall caption capture.
+      socket.timeout(20000).emit(
         "caption:audio-chunk",
         { audio: toPcm16(pcm) },
-        (response = {}) => {
+        (timeoutError, response = {}) => {
           sending = false;
-          if (response?.ok === false)
+          if (timeoutError) console.warn("Caption chunk timed out");
+          else if (response?.ok === false)
             console.warn("Caption audio chunk was rejected:", response.error);
           flushChunk();
         },
@@ -121,7 +121,6 @@ export function useCaptionAudio({
       silentGain.gain.value = 0;
       processor.connect(silentGain);
       silentGain.connect(context.destination);
-      setCaptureState("listening");
 
       return () => {
         stopped = true;
@@ -137,10 +136,8 @@ export function useCaptionAudio({
       };
     } catch (error) {
       console.error("Unable to start caption audio capture:", error);
-      setCaptureState("error");
       return undefined;
     }
-  }, [stream, socket, enabled, sourceLanguage, targetLanguage]);
+  }, [stream, socket, enabled, sourceLanguage, targetLanguage, epoch]);
 
-  return captureState;
 }

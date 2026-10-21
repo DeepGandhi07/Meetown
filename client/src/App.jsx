@@ -1,343 +1,140 @@
-import { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
-import * as mediasoupClient from "mediasoup-client";
+import { useEffect, useMemo, useState } from "react";
 import VideoTile from "./components/meeting/VideoTile.jsx";
 import LiveCaptionOverlay from "./components/captions/LiveCaptionOverlay.jsx";
 import CaptionPanel from "./components/captions/CaptionPanel.jsx";
 import { useLiveCaptions } from "./hooks/useLiveCaptions.js";
 import { useCaptionAudio } from "./hooks/useCaptionAudio.js";
-import { request } from "./services/signaling.js";
+import { useMeeting } from "./hooks/useMeeting.js";
+import { createMeetingId } from "./services/api.js";
 
-function getSignalingUrl() {
-  // Same-origin connection: Vite proxies /socket.io to the local Node server.
-  // This avoids localhost pointing at the phone and avoids HTTPS mixed content.
-  return window.location.origin;
+const CONNECTION_LABEL = {
+  connected: "Room is active",
+  reconnecting: "Reconnecting…",
+  disconnected: "Disconnected",
+};
+
+function readStored(key, fallback) {
+  try {
+    return window.localStorage.getItem(key) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function useIsMobile() {
+  const query = "(max-width: 560px)";
+  const [mobile, setMobile] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const onChange = () => setMobile(media.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+  return mobile;
+}
+
+function gridColumns(count, mobile) {
+  if (mobile) return count <= 2 ? 1 : 2;
+  if (count <= 1) return 1;
+  if (count <= 4) return 2;
+  if (count <= 9) return 3;
+  return 4;
 }
 
 export default function App() {
-  const [roomId, setRoomId] = useState("team-meeting");
-  const [name, setName] = useState("Guest");
-  const [joined, setJoined] = useState(false);
-  const [error, setError] = useState("");
-  const [muted, setMuted] = useState(false);
-  const [cameraOff, setCameraOff] = useState(false);
-  const [participants, setParticipants] = useState([]);
+  const initialRoom = new URLSearchParams(window.location.search).get("room");
+  const [roomId, setRoomId] = useState(initialRoom || "team-meeting");
+  const [name, setName] = useState(() => readStored("meetown:name", "Guest"));
   const [activePanel, setActivePanel] = useState("translate");
   const [targetLanguage, setTargetLanguage] = useState("English");
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
-  const [meetingSocket, setMeetingSocket] = useState(null);
-  const localStreamRef = useRef(null);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatError, setChatError] = useState("");
+  const [page, setPage] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const mobile = useIsMobile();
+
+  const meeting = useMeeting();
+  const {
+    joined, joining, connection, error, notice, tiles, me, socket, socketEpoch,
+    localAudioStream, audioBlocked, devices, activeDevices, chatMessages,
+    persistence, notes, notesState,
+  } = meeting;
+
+  const localTile = tiles.find((tile) => tile.local && !tile.screen);
+  const muted = localTile ? localTile.micMuted : false;
+  const cameraOff = localTile ? !localTile.hasVideo : false;
+  const canShareScreen =
+    typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getDisplayMedia);
+  const sharingScreen = tiles.some((tile) => tile.local && tile.screen);
 
   const {
     captions,
     connectionState: captionConnectionState,
+    statusMessage: captionStatusMessage,
     addPreviewCaption,
     clearCaptions,
   } = useLiveCaptions({
-    socket: meetingSocket,
+    socket,
     enabled: joined && captionsEnabled,
     targetLanguage,
     sourceLanguage,
   });
   useCaptionAudio({
-    stream: joined ? localStreamRef.current : null,
-    socket: meetingSocket,
+    stream: joined ? localAudioStream : null,
+    socket,
     enabled: joined && captionsEnabled && !muted,
     sourceLanguage,
     targetLanguage,
+    epoch: socketEpoch,
   });
-  const [chatDraft, setChatDraft] = useState("");
-  const [chatMessages, setChatMessages] = useState([]);
-  const [meetingNotes, setMeetingNotes] = useState("");
-
-  const socketRef = useRef(null);
-  const sendTransportRef = useRef(null);
-  const recvTransportRef = useRef(null);
-  const producersRef = useRef([]);
-  const consumersRef = useRef(new Map());
-  const streamsRef = useRef(new Map());
-  const deviceRef = useRef(null);
-  const activeRef = useRef(false);
-  const pendingRef = useRef([]);
-  const producerPeersRef = useRef(new Map());
-  const consumedProducerIdsRef = useRef(new Set());
-
-  function addParticipant(peerId, participantName, stream, local = false) {
-    setParticipants((current) => {
-      const index = current.findIndex((p) => p.peerId === peerId);
-      const entry = {
-        peerId,
-        name: participantName,
-        stream,
-        local,
-      };
-
-      if (index >= 0) {
-        const next = [...current];
-        next[index] = entry;
-        return next;
-      }
-
-      return [...current, entry];
-    });
-  }
-
-  function removeParticipant(peerId) {
-    setParticipants((current) => current.filter((p) => p.peerId !== peerId));
-  }
-
-  async function consumeProducer(info) {
-    const socket = socketRef.current;
-    const transport = recvTransportRef.current;
-    const device = deviceRef.current;
-
-    // This function runs in response to a media event,
-    // not during React rendering.
-    if (!activeRef.current || !transport || !device) {
-      pendingRef.current.push(info);
-      return;
-    }
-
-    // Prevent duplicate consumers for the same producer.
-    if (consumedProducerIdsRef.current.has(info.producerId)) {
-      return;
-    }
-
-    consumedProducerIdsRef.current.add(info.producerId);
-    producerPeersRef.current.set(info.producerId, info.peerId);
-
-    try {
-      const params = await request(socket, "consume", {
-        transportId: transport.id,
-        producerId: info.producerId,
-      });
-
-      const consumer = await transport.consume(params);
-      consumersRef.current.set(consumer.id, consumer);
-
-      let stream = streamsRef.current.get(info.peerId);
-
-      if (!stream) {
-        stream = new MediaStream();
-        streamsRef.current.set(info.peerId, stream);
-      }
-
-      stream.addTrack(consumer.track);
-
-      addParticipant(info.peerId, info.name || "Participant", stream);
-
-      await request(socket, "resume-consumer", {
-        consumerId: consumer.id,
-      });
-    } catch (error) {
-      // Allow retry if creating the consumer failed.
-      consumedProducerIdsRef.current.delete(info.producerId);
-      producerPeersRef.current.delete(info.producerId);
-      throw error;
-    }
-  }
 
   async function joinMeeting() {
     try {
-      setError("");
+      window.localStorage.setItem("meetown:name", name.trim());
+    } catch {
+      /* storage can be unavailable (private mode) */
+    }
+    setPage(0);
+    await meeting.join({ roomId, name });
+  }
 
-      if (!roomId.trim() || !name.trim()) {
-        throw new Error("Enter your name and a meeting ID.");
-      }
-
-      const socket = io(getSignalingUrl(), {
-        transports: ["websocket", "polling"],
-        timeout: 10000,
-        reconnection: true,
-      });
-      socketRef.current = socket;
-      setMeetingSocket(socket);
-
-      await new Promise((resolve, reject) => {
-        socket.once("connect", resolve);
-        socket.once("connect_error", (connectionError) => {
-          reject(
-            new Error(
-              `Cannot connect to Meetown signaling server at ${getSignalingUrl()}: ${connectionError.message}. Check server/.env, Windows Firewall, and that your phone and PC are on the same Wi-Fi.`,
-            ),
-          );
-        });
-      });
-
-      const room = await request(socket, "join-room", {
-        roomId: roomId.trim(),
-        name: name.trim(),
-      });
-
-      const device = new mediasoupClient.Device();
-      await device.load({
-        routerRtpCapabilities: room.routerRtpCapabilities,
-      });
-
-      deviceRef.current = device;
-
-      await request(socket, "set-rtp-capabilities", {
-        rtpCapabilities: device.rtpCapabilities,
-      });
-
-      // Ask the browser for local audio and video.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-          frameRate: { ideal: 24, max: 30 },
-        },
-      });
-
-      localStreamRef.current = stream;
-      addParticipant(socket.id, name.trim(), stream, true);
-
-      // Create the outgoing media transport.
-      const sendParams = await request(socket, "create-transport");
-      const sendTransport = device.createSendTransport(sendParams);
-      sendTransportRef.current = sendTransport;
-
-      sendTransport.on("connect", ({ dtlsParameters }, callback, errback) => {
-        request(socket, "connect-transport", {
-          transportId: sendTransport.id,
-          dtlsParameters,
-        })
-          .then(callback)
-          .catch(errback);
-      });
-
-      sendTransport.on(
-        "produce",
-        ({ kind, rtpParameters }, callback, errback) => {
-          request(socket, "produce", {
-            transportId: sendTransport.id,
-            kind,
-            rtpParameters,
-          })
-            .then(({ id }) => callback({ id }))
-            .catch(errback);
-        },
-      );
-
-      // Create the incoming media transport.
-      const recvParams = await request(socket, "create-transport");
-      const recvTransport = device.createRecvTransport(recvParams);
-      recvTransportRef.current = recvTransport;
-
-      recvTransport.on("connect", ({ dtlsParameters }, callback, errback) => {
-        request(socket, "connect-transport", {
-          transportId: recvTransport.id,
-          dtlsParameters,
-        })
-          .then(callback)
-          .catch(errback);
-      });
-
-      // Publish local audio and video.
-      for (const track of stream.getTracks()) {
-        const producer = await sendTransport.produce({ track });
-        producersRef.current.push(producer);
-      }
-
-      activeRef.current = true;
-      setJoined(true);
-
-      socket.on("new-producer", (info) => {
-        consumeProducer(info).catch((err) => {
-          console.error("Unable to receive media:", err);
-          setError(err.message);
-        });
-      });
-
-      socket.on("peer-left", ({ peerId }) => {
-        const stream = streamsRef.current.get(peerId);
-        stream?.getTracks().forEach((track) => track.stop());
-        streamsRef.current.delete(peerId);
-
-        for (const [id, consumer] of consumersRef.current) {
-          if (producerPeersRef.current.get(consumer.producerId) === peerId) {
-            consumer.close();
-            consumersRef.current.delete(id);
-            consumedProducerIdsRef.current.delete(consumer.producerId);
-            producerPeersRef.current.delete(consumer.producerId);
-          }
-        }
-        removeParticipant(peerId);
-      });
-
-      for (const producer of room.existingProducers) {
-        await consumeProducer(producer);
-      }
-
-      for (const info of pendingRef.current.splice(0)) {
-        await consumeProducer(info);
-      }
-    } catch (err) {
-      setError(err.message || "Unable to join the meeting.");
-      console.error(err);
+  async function generateMeetingId() {
+    try {
+      setRoomId(await createMeetingId());
+    } catch {
+      /* the server error will surface on join */
     }
   }
 
-  function toggleMicrophone() {
-    const track = localStreamRef.current?.getAudioTracks()[0];
-
-    if (track) {
-      track.enabled = !track.enabled;
-      setMuted(!track.enabled);
+  const inviteLink = `${window.location.origin}/?room=${encodeURIComponent(roomId)}`;
+  async function copyInvite() {
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      window.prompt("Copy this invite link:", inviteLink);
     }
   }
 
-  function toggleCamera() {
-    const track = localStreamRef.current?.getVideoTracks()[0];
-
-    if (track) {
-      track.enabled = !track.enabled;
-      setCameraOff(!track.enabled);
+  // Paging: 12 tiles per page on desktop, 4 on phones. The newest remote speaker is kept on page 1.
+  const pageSize = mobile ? 4 : 12;
+  const ordered = useMemo(() => {
+    const list = [...tiles];
+    const screenIndex = list.findIndex((tile) => tile.screen);
+    if (screenIndex > 0) list.unshift(...list.splice(screenIndex, 1));
+    const speakerIndex = list.findIndex((tile) => tile.speaking && !tile.local && !tile.screen);
+    if (speakerIndex >= pageSize) {
+      [list[pageSize - 1], list[speakerIndex]] = [list[speakerIndex], list[pageSize - 1]];
     }
-  }
-
-  function leaveMeeting() {
-    activeRef.current = false;
-
-    producersRef.current.forEach((p) => p.close());
-    consumersRef.current.forEach((c) => c.close());
-    sendTransportRef.current?.close();
-    recvTransportRef.current?.close();
-
-    localStreamRef.current?.getTracks().forEach((t) => t.stop());
-    streamsRef.current.forEach((s) => s.getTracks().forEach((t) => t.stop()));
-
-    socketRef.current?.disconnect();
-
-    socketRef.current = null;
-    setMeetingSocket(null);
-    localStreamRef.current = null;
-    sendTransportRef.current = null;
-    recvTransportRef.current = null;
-    producersRef.current = [];
-    consumersRef.current.clear();
-    streamsRef.current.clear();
-    pendingRef.current = [];
-    producerPeersRef.current.clear();
-    consumedProducerIdsRef.current.clear();
-
-    setParticipants([]);
-    setJoined(false);
-    setMuted(false);
-    setCameraOff(false);
-  }
-
-  useEffect(() => {
-    return () => {
-      activeRef.current = false;
-      socketRef.current?.disconnect();
-      localStreamRef.current?.getTracks().forEach((t) => t.stop());
-      sendTransportRef.current?.close();
-      recvTransportRef.current?.close();
-    };
-  }, []);
+    return list;
+  }, [tiles, pageSize]);
+  const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const visibleTiles = ordered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const people = tiles.filter((tile) => !tile.screen);
 
   if (!joined) {
     return (
@@ -404,6 +201,7 @@ export default function App() {
                     onChange={(e) => setName(e.target.value)}
                     maxLength={60}
                     placeholder="How should people call you?"
+                    autoComplete="nickname"
                     required
                   />
                 </div>
@@ -415,16 +213,25 @@ export default function App() {
                     value={roomId}
                     onChange={(e) => setRoomId(e.target.value)}
                     placeholder="e.g. product-sync"
+                    pattern="[A-Za-z0-9_\-]{3,64}"
+                    title="3–64 letters, numbers, - or _"
                     required
                   />
                 </div>
-                <button className="primary-button" type="submit">
-                  <span>Join meeting</span>
+                <button
+                  type="button"
+                  className="text-button new-id-button"
+                  onClick={generateMeetingId}
+                >
+                  Generate a new meeting ID
+                </button>
+                <button className="primary-button" type="submit" disabled={joining}>
+                  <span>{joining ? "Joining…" : "Join meeting"}</span>
                   <span className="button-arrow">↗</span>
                 </button>
-                {error && (
+                {(error || notice) && (
                   <p className="error" role="alert">
-                    {error}
+                    {error || notice}
                   </p>
                 )}
                 <div className="secure-note">
@@ -448,8 +255,8 @@ export default function App() {
                       </span>
                     </h3>
                     <p>
-                      Live translated captions are on our roadmap — designed for
-                      conversations across languages.
+                      Live captions with translation into your language, so
+                      everyone can follow along.
                     </p>
                   </div>
                   <div className="language-pills">
@@ -494,15 +301,26 @@ export default function App() {
     );
   }
 
-  const sendLocalMessage = (event) => {
+  async function sendMessage(event) {
     event.preventDefault();
-    if (!chatDraft.trim()) return;
-    setChatMessages((items) => [
-      ...items,
-      { id: Date.now(), name: name || "You", text: chatDraft.trim() },
-    ]);
-    setChatDraft("");
-  };
+    const text = chatDraft.trim();
+    if (!text) return;
+    setChatError("");
+    try {
+      await meeting.sendChat(text);
+      setChatDraft("");
+    } catch (sendError) {
+      setChatError(sendError.message || "Message could not be sent.");
+    }
+  }
+
+  const panelTitle = {
+    translate: "Live translate",
+    chat: "Meeting chat",
+    notes: "Shared notes",
+    people: "Participants",
+    settings: "Settings",
+  }[activePanel];
 
   return (
     <main className="app-shell meeting-shell">
@@ -516,10 +334,10 @@ export default function App() {
           </span>
           <span className="topbar-divider" />
         </div>
-        <div className="meeting-title">
+        <div className={`meeting-title conn-${connection}`}>
           <strong>{roomId}</strong>
           <span>
-            <i className="footer-dot" /> Room is active
+            <i className="footer-dot" /> {CONNECTION_LABEL[connection] || "Connecting…"}
           </span>
         </div>
         <div className="meeting-top-actions">
@@ -529,13 +347,12 @@ export default function App() {
           <button
             className="icon-button"
             title="Meeting settings"
+            aria-label="Meeting settings"
             onClick={() => setActivePanel("settings")}
           >
             ⚙
           </button>
-          <div className="avatar-mini">
-            {(name || "G").slice(0, 1).toUpperCase()}
-          </div>
+          <div className="avatar-mini">{(name || "G").slice(0, 1).toUpperCase()}</div>
         </div>
       </header>
       <div className="meeting-layout">
@@ -547,26 +364,62 @@ export default function App() {
                 You're in the room<span className="heading-period">.</span>
               </h1>
             </div>
-            <div className="participant-count">
+            <button
+              type="button"
+              className="participant-count"
+              onClick={() => setActivePanel("people")}
+              aria-label="Show participants"
+            >
               <span className="participant-count-icon">♙</span>
-              {participants.length} <span>participants</span>
-            </div>
+              {people.length} <span>participants</span>
+            </button>
           </div>
+          {audioBlocked && (
+            <div className="banner warn" role="alert">
+              <span>Your browser is blocking meeting audio until you interact with the page.</span>
+              <button className="text-button" onClick={meeting.startAudio}>
+                Enable audio
+              </button>
+            </div>
+          )}
+          {connection === "disconnected" && (
+            <div className="banner warn" role="alert">
+              <span>{error || "You were disconnected from the meeting."}</span>
+              <button className="text-button" onClick={meeting.rejoin}>
+                Rejoin
+              </button>
+            </div>
+          )}
           <section
-            className={`video-grid participant-count-${Math.min(participants.length, 4)}`}
+            className="video-grid"
+            data-cols-m={gridColumns(visibleTiles.length, true)}
+            style={{
+              "--cols": gridColumns(visibleTiles.length, false),
+              "--cols-m": gridColumns(visibleTiles.length, true),
+            }}
           >
-            {participants.map((p, index) => (
+            {visibleTiles.map((tile) => (
               <div
-                className={`video-tile ${p.local ? "local-tile" : ""}`}
-                key={p.peerId}
+                className={`video-tile ${tile.local ? "local-tile" : ""} ${
+                  tile.speaking ? "speaking-tile" : ""
+                } ${tile.screen ? "screen-tile spotlight" : ""}`}
+                key={tile.peerId}
               >
-                <VideoTile stream={p.stream} name={p.name} muted={p.local} />
-                <span className="tile-presence">
-                  <i /> {p.local ? "You" : "Connected"}
+                <VideoTile
+                  stream={tile.stream}
+                  name={tile.local && !tile.screen ? `${tile.name} (You)` : tile.name}
+                  muted={tile.local}
+                  hasVideo={tile.hasVideo}
+                  micMuted={tile.micMuted}
+                  mirror={tile.local && !tile.screen}
+                  fit={tile.screen ? "contain" : "cover"}
+                />
+                <span className={`tile-presence ${tile.quality === "poor" ? "tile-weak" : ""}`}>
+                  <i /> {tile.local ? "You" : tile.quality === "poor" ? "Weak connection" : "Connected"}
                 </span>
               </div>
             ))}
-            {participants.length === 0 && (
+            {tiles.length === 0 && (
               <div className="empty-stage">
                 <div className="empty-orb">✦</div>
                 <h3>Getting your space ready</h3>
@@ -574,8 +427,39 @@ export default function App() {
               </div>
             )}
           </section>
+          {pageCount > 1 && (
+            <div className="grid-pager">
+              <button
+                className="icon-button"
+                onClick={() => setPage(safePage - 1)}
+                disabled={safePage === 0}
+                aria-label="Previous page"
+              >
+                ‹
+              </button>
+              <span>
+                Page {safePage + 1} of {pageCount}
+              </span>
+              <button
+                className="icon-button"
+                onClick={() => setPage(safePage + 1)}
+                disabled={safePage >= pageCount - 1}
+                aria-label="Next page"
+              >
+                ›
+              </button>
+            </div>
+          )}
           <LiveCaptionOverlay captions={captions} enabled={captionsEnabled} />
-          {error && (
+          {notice && (
+            <div className="banner warn" role="status">
+              <span>{notice}</span>
+              <button className="text-button" onClick={meeting.dismissNotice}>
+                Dismiss
+              </button>
+            </div>
+          )}
+          {error && connection !== "disconnected" && (
             <p className="error meeting-error" role="alert">
               {error}
             </p>
@@ -584,53 +468,56 @@ export default function App() {
             <div className="call-toolbar">
               <button
                 className={`control-button ${muted ? "control-off" : ""}`}
-                onClick={toggleMicrophone}
+                onClick={meeting.toggleMicrophone}
               >
                 <span className="control-glyph">{muted ? "♩̸" : "♩"}</span>
                 <span>{muted ? "Unmute" : "Mute"}</span>
               </button>
               <button
                 className={`control-button ${cameraOff ? "control-off" : ""}`}
-                onClick={toggleCamera}
+                onClick={meeting.toggleCamera}
               >
-                <span className="control-glyph">{cameraOff ? "▣" : "▣"}</span>
+                <span className="control-glyph">▣</span>
                 <span>{cameraOff ? "Start video" : "Stop video"}</span>
               </button>
+              {canShareScreen && !mobile && (
+                <button
+                  className={`control-button ${sharingScreen ? "control-selected" : ""}`}
+                  onClick={meeting.toggleScreenShare}
+                >
+                  <span className="control-glyph">⇪</span>
+                  <span>{sharingScreen ? "Stop share" : "Share"}</span>
+                </button>
+              )}
               <button
                 className={`control-button ${activePanel === "translate" ? "control-selected" : ""}`}
-                onClick={() =>
-                  setActivePanel(activePanel === "translate" ? "" : "translate")
-                }
+                onClick={() => setActivePanel(activePanel === "translate" ? "" : "translate")}
               >
                 <span className="control-glyph">文</span>
                 <span>Translate</span>
               </button>
               <button
                 className={`control-button ${activePanel === "chat" ? "control-selected" : ""}`}
-                onClick={() =>
-                  setActivePanel(activePanel === "chat" ? "" : "chat")
-                }
+                onClick={() => setActivePanel(activePanel === "chat" ? "" : "chat")}
               >
                 <span className="control-glyph">▤</span>
                 <span>Chat</span>
               </button>
               <button
                 className={`control-button ${activePanel === "notes" ? "control-selected" : ""}`}
-                onClick={() =>
-                  setActivePanel(activePanel === "notes" ? "" : "notes")
-                }
+                onClick={() => setActivePanel(activePanel === "notes" ? "" : "notes")}
               >
                 <span className="control-glyph">✎</span>
                 <span>Notes</span>
               </button>
               <span className="toolbar-separator" />
-              <button className="leave-button" onClick={leaveMeeting}>
+              <button className="leave-button" onClick={meeting.leave}>
                 <span>↗</span> Leave
               </button>
             </div>
             <div className="toolbar-hint">
-              <span className="shortcut-key">⌘</span> Tip: choose Translate to
-              configure your caption language
+              <span className="shortcut-key">⌘</span> Tip: choose Translate to configure your
+              caption language
             </div>
           </div>
         </section>
@@ -639,15 +526,7 @@ export default function App() {
             <div className="panel-heading">
               <div>
                 <span className="eyebrow">MEETING TOOLS</span>
-                <h2>
-                  {activePanel === "translate"
-                    ? "Live translate"
-                    : activePanel === "chat"
-                      ? "Meeting chat"
-                      : activePanel === "notes"
-                        ? "Shared notes"
-                        : "Settings"}
-                </h2>
+                <h2>{panelTitle}</h2>
               </div>
               <button
                 className="icon-button"
@@ -658,24 +537,20 @@ export default function App() {
               </button>
             </div>
             <div className="panel-tabs">
-              <button
-                className={activePanel === "translate" ? "active" : ""}
-                onClick={() => setActivePanel("translate")}
-              >
-                Translate
-              </button>
-              <button
-                className={activePanel === "chat" ? "active" : ""}
-                onClick={() => setActivePanel("chat")}
-              >
-                Chat
-              </button>
-              <button
-                className={activePanel === "notes" ? "active" : ""}
-                onClick={() => setActivePanel("notes")}
-              >
-                Notes
-              </button>
+              {[
+                ["translate", "Translate"],
+                ["chat", "Chat"],
+                ["notes", "Notes"],
+                ["people", "People"],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  className={activePanel === key ? "active" : ""}
+                  onClick={() => setActivePanel(key)}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
             {activePanel === "translate" && (
               <CaptionPanel
@@ -687,6 +562,7 @@ export default function App() {
                 onTargetLanguageChange={setTargetLanguage}
                 captions={captions}
                 connectionState={captionConnectionState}
+                statusMessage={captionStatusMessage}
                 onPreviewCaption={addPreviewCaption}
                 onClearCaptions={clearCaptions}
               />
@@ -701,38 +577,48 @@ export default function App() {
                     <div className="chat-empty">
                       <span>▤</span>
                       <b>Start the conversation</b>
-                      <p>
-                        Send a message to try the chat interface. Server-synced
-                        chat will be wired in a later step.
-                      </p>
+                      <p>Messages are shared with everyone in this meeting.</p>
                     </div>
                   ) : (
                     chatMessages.map((message) => (
-                      <div className="chat-message" key={message.id}>
+                      <div
+                        className={`chat-message ${message.identity === me.identity ? "own" : ""}`}
+                        key={message.id}
+                      >
                         <span className="chat-message-avatar">
                           {message.name.slice(0, 1).toUpperCase()}
                         </span>
                         <div>
                           <b>{message.name}</b>
+                          <span className="chat-time">
+                            {new Date(message.createdAt).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
+                          </span>
                           <p>{message.text}</p>
                         </div>
                       </div>
                     ))
                   )}
                 </div>
-                <form className="chat-compose" onSubmit={sendLocalMessage}>
+                <form className="chat-compose" onSubmit={sendMessage}>
                   <input
                     value={chatDraft}
                     onChange={(e) => setChatDraft(e.target.value)}
                     placeholder="Write a message…"
                     aria-label="Write a message"
+                    maxLength={2000}
                   />
                   <button type="submit" aria-label="Send message">
                     ↗
                   </button>
                 </form>
+                {chatError && <p className="error">{chatError}</p>}
                 <p className="panel-disclaimer">
-                  Prototype: messages currently stay in this browser session.
+                  {persistence === "database"
+                    ? "Messages are saved with this meeting."
+                    : "Messages are kept only while the server is running."}
                 </p>
               </div>
             )}
@@ -740,21 +626,55 @@ export default function App() {
               <div className="panel-content notes-panel">
                 <div className="notes-toolbar">
                   <span>✎ &nbsp;Team notes</span>
-                  <span className="saved-label">
-                    <i /> Local draft
+                  <span className={`saved-label ${notesState === "error" ? "error-label" : ""}`}>
+                    <i />{" "}
+                    {{
+                      saving: "Saving…",
+                      saved: "Saved & shared",
+                      error: "Not saved — retry by typing",
+                    }[notesState] || "Not yet saved"}
                   </span>
                 </div>
                 <textarea
-                  value={meetingNotes}
-                  onChange={(e) => setMeetingNotes(e.target.value)}
+                  value={notes}
+                  onChange={(e) => meeting.setNotes(e.target.value)}
                   placeholder={
                     "Capture decisions, ideas, and action items…\n\n• Decision:\n• Owner:\n• Next step:"
                   }
+                  maxLength={50000}
                 />
                 <div className="notes-footnote">
-                  Notes are a local UI draft for now. Shared persistence and
-                  live collaboration come next.
+                  Notes are shared live with everyone in the meeting.
                 </div>
+              </div>
+            )}
+            {activePanel === "people" && (
+              <div className="panel-content">
+                <ul className="people-list">
+                  {people.map((person) => (
+                    <li key={person.peerId}>
+                      <span className="chat-message-avatar">
+                        {person.name.slice(0, 1).toUpperCase()}
+                      </span>
+                      <b>
+                        {person.name}
+                        {person.local ? " (You)" : ""}
+                      </b>
+                      <span className="people-state">
+                        <span className={person.micMuted ? "off" : ""}>
+                          {person.micMuted ? "Mic off" : "Mic on"}
+                        </span>
+                        {" · "}
+                        <span className={person.hasVideo ? "" : "off"}>
+                          {person.hasVideo ? "Cam on" : "Cam off"}
+                        </span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <button className="secondary-button" onClick={copyInvite}>
+                  {copied ? "Link copied" : "Copy invite link"}
+                </button>
               </div>
             )}
             {activePanel === "settings" && (
@@ -768,6 +688,9 @@ export default function App() {
                   <button
                     className={`switch ${captionsEnabled ? "on" : ""}`}
                     onClick={() => setCaptionsEnabled(!captionsEnabled)}
+                    role="switch"
+                    aria-checked={captionsEnabled}
+                    aria-label="Toggle translated captions"
                   >
                     <span />
                   </button>
@@ -777,23 +700,43 @@ export default function App() {
                     <b>Target language</b>
                     <small>{targetLanguage}</small>
                   </div>
-                  <button
-                    className="text-button"
-                    onClick={() => setActivePanel("translate")}
-                  >
+                  <button className="text-button" onClick={() => setActivePanel("translate")}>
                     Change
                   </button>
                 </div>
+                {[
+                  ["audioinput", "Microphone"],
+                  ["videoinput", "Camera"],
+                  ["audiooutput", "Speaker"],
+                ].map(
+                  ([kind, label]) =>
+                    devices[kind]?.length > 0 && (
+                      <div className="settings-row" key={kind} style={{ display: "block" }}>
+                        <b>{label}</b>
+                        <select
+                          className="dark-select settings-select"
+                          aria-label={label}
+                          value={activeDevices[kind] || ""}
+                          onChange={(e) => meeting.switchDevice(kind, e.target.value)}
+                        >
+                          {devices[kind].map((device, index) => (
+                            <option key={device.deviceId} value={device.deviceId}>
+                              {device.label || `${label} ${index + 1}`}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ),
+                )}
                 <div className="settings-row">
                   <div>
                     <b>Room ID</b>
                     <small>{roomId}</small>
                   </div>
+                  <button className="text-button" onClick={copyInvite}>
+                    {copied ? "Copied" : "Copy link"}
+                  </button>
                 </div>
-                <p className="panel-disclaimer">
-                  More audio, video, and privacy controls will be added in later
-                  phases.
-                </p>
               </div>
             )}
           </aside>
